@@ -1,5 +1,13 @@
-# DeepSeek Harness overlay patch to load the Zotero Academic plugin
-# Run with: pnpm dsh web --patch ./cordis.yml
+# DeepSeek Harness 运行时加载补丁配置
+#
+# 方式一（标准模式）：通过 npm / pnpm 链接或安装插件包
+#   在 Harness 根目录运行: pnpm link /path/to/dsh-zotero-academic
+#   随后以模块名加载: dsh-zotero-academic
+#
+# 方式二（源码开发模式）：将 name 设置为当前插件入口文件相对或绝对路径
+#   例如: ./plugins/dsh-zotero-academic/dist/index.js
+
 - insert:
     - id: zotero-academic
-      name: 'C:/Users/panxi/Desktop/dsh-zotero-academic/src/index.ts'
+      name: dsh-zotero-academic
+
