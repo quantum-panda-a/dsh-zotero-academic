@@ -1,0 +1,5 @@
+# DeepSeek Harness overlay patch to load the Zotero Academic plugin
+# Run with: pnpm dsh web --patch ./cordis.yml
+- insert:
+    - id: zotero-academic
+      name: 'C:/Users/panxi/Desktop/dsh-zotero-academic/src/index.ts'

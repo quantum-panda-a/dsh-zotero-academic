@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+env/
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+*.egg-info/
+
+# Build artifacts (host TypeScript and esbuild)
+# Note: For npm packages, dist can be built via npm run build
+dist/
+
+# Local data and cache
+*.sqlite
+*.sqlite3
+.chroma/
+chroma_db/
+*.log
+
+# Environments & sensitive files
+.env
+.env.*
+!.env.example
+.credentials.yaml
+
+# System & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

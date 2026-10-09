@@ -1,0 +1,61 @@
+{
+  "name": "dsh-zotero-academic",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "DeepSeek Harness academic research companion plugin: vector semantic search, PDF deep reading, citations export, and literature intake",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": "./dist/client.js"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-tool"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "tsc && npm run build:client",
+    "build:client": "node scripts/build-client.mjs",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "deepseek",
+    "cordis",
+    "zotero",
+    "semantic-search",
+    "academic",
+    "research",
+    "plugin"
+  ],
+  "author": "",
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-jobs": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-jobs": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.5.0"
+  }
+}

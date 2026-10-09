@@ -1,0 +1,806 @@
+import contextlib
+import json
+import logging
+import os
+import re
+import sys
+import tempfile
+import threading
+from contextlib import contextmanager
+
+from unidecode import unidecode
+
+html_re = re.compile(r"<.*?>")
+
+#: How this client identifies itself to third-party services.
+#:
+#: Deliberately not "Mozilla/5.0 (compatible; ...)". SpringerLink's WAF
+#: challenges a Mozilla-prefixed UA when the connection behind it is not a
+#: browser's, and served a short challenge page instead of the article --
+#: measured 2026-09-03 on link.springer.com/article/10.1006/bulm.1999.0141,
+#: where the honest form below was served the full page and its citation_*
+#: tags while every Mozilla-prefixed form, including a verbatim Chrome UA,
+#: was not. Whether other publishers behave the same way is untested.
+#:
+#: Lives here rather than in the tools layer so that every module can reach
+#: it without an import cycle. Several outbound clients still send no UA at
+#: all (OpenAlex, Unpaywall, Semantic Scholar, PMC, arXiv, scite, GitHub);
+#: converting those is worth doing and is not done here.
+USER_AGENT = "zotero-mcp/1.0 (+https://github.com/54yyyu/zotero-mcp)"
+
+# Distribution name on PyPI, used to build install/upgrade hints.
+PACKAGE_NAME = "zotero-mcp-server"
+
+
+_logger = logging.getLogger(__name__)
+_warned_open_dirs: set[str] = set()
+
+
+def ensure_private_dir(path) -> None:
+    """Create *path* owner-only, and say so if an existing one is not.
+
+    ``~/.config/zotero-mcp`` holds ``config.json`` (API keys) and ``chroma_db``
+    (the indexed metadata and full text of the library). ``mkdir`` inherits the
+    umask, which commonly makes it ``0755``, so any local account could read the
+    index (#401). A directory created here is ``0700``, which also shuts other
+    users out of everything inside it whatever mode those files get.
+
+    An existing directory is left alone: its mode may be deliberate, and
+    tightening it silently on every run would be a surprise. If other users
+    can read it, a warning says how to fix it, once per process. No-op for
+    permissions on platforms without POSIX modes.
+    """
+    from pathlib import Path
+
+    path = Path(path)
+    existed = path.is_dir()
+    path.mkdir(parents=True, exist_ok=True)
+    if os.name != "posix":
+        return
+    try:
+        if not existed:
+            os.chmod(path, 0o700)
+        elif path.stat().st_mode & 0o077 and str(path) not in _warned_open_dirs:
+            _warned_open_dirs.add(str(path))
+            _logger.warning(
+                "%s is readable by other users on this machine and holds your "
+                "Zotero index and credentials; run `chmod 700 %s` to restrict it.",
+                path, path,
+            )
+    except OSError:
+        pass
+
+
+def write_json_atomic(path, data) -> None:
+    """Write ``data`` as JSON to ``path``, owner-only, via a temp file and a rename.
+
+    A concurrent reader sees the old file or the new one, never half of it,
+    and a crash mid-write leaves the old file intact. The temp name is unique
+    per call, so concurrent writers (threads or processes) never share one,
+    and ``mkstemp`` creates it owner-only, so a credential is never readable
+    by others, even before the rename. A symlinked ``path`` is written through
+    (dotfile managers): replacing the link itself would leave the real file
+    stale.
+    """
+    from pathlib import Path
+
+    path = Path(path).resolve()
+    ensure_private_dir(path.parent)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(temp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_path)
+        raise
+
+
+def detect_install_flavor() -> str | None:
+    """Best-effort detection of how this package was installed.
+
+    ``uv tool install`` places the package under ``.../uv/tools/<name>/lib/...``
+    and pipx under ``.../pipx/venvs/<name>/lib/...``. Anything else (venv,
+    conda, system site-packages) is most likely pip-managed, but we cannot
+    prove it, so it is reported as unknown (``None``).
+
+    Both installers also leave a marker at the root of the environment they
+    create: ``uv-receipt.toml`` for uv, ``pipx_metadata.json`` for pipx. That
+    root is ``sys.prefix``, so the markers still identify the installer when
+    the environment lives somewhere else (``UV_TOOL_DIR``, ``PIPX_HOME``, a
+    relocated data directory), where the path test above would fall through
+    and the user would be shown ``pip`` first (#534).
+
+    Returns:
+        ``"uv"``, ``"pipx"``, or ``None`` when the flavor is undetermined.
+    """
+    path = os.path.abspath(__file__).replace("\\", "/")
+    if "/uv/tools/" in path:
+        return "uv"
+    if "/pipx/venvs/" in path:
+        return "pipx"
+    prefix = sys.prefix
+    if os.path.isfile(os.path.join(prefix, "uv-receipt.toml")):
+        return "uv"
+    if os.path.isfile(os.path.join(prefix, "pipx_metadata.json")):
+        return "pipx"
+    return None
+
+
+def install_command(extra: str | None = None, flavor: str | None = None) -> str:
+    """Return the command that installs/upgrades the package with *extra*.
+
+    Args:
+        extra: Optional extras name (e.g. ``"semantic"``, ``"pdf"``).
+        flavor: Override for the detected installer ("uv", "pipx", "pip").
+    """
+    target = f"{PACKAGE_NAME}[{extra}]" if extra else PACKAGE_NAME
+    flavor = flavor or detect_install_flavor()
+    if flavor == "uv":
+        return f"uv tool install --upgrade '{target}'"
+    if flavor == "pipx":
+        return f"pipx install --force '{target}'"
+    return f"pip install '{target}'"
+
+
+def install_hint(extra: str | None = None) -> str:
+    """Install instruction matching how zotero-mcp was actually installed.
+
+    A hardcoded ``pip install`` line is wrong — and silently does nothing
+    useful — for ``uv tool``/pipx installs (issue #388). When the flavor is
+    unambiguous we print only the command that works there; otherwise we print
+    the pip command together with the uv and pipx equivalents so no user is
+    left with a command that cannot work for them.
+    """
+    flavor = detect_install_flavor()
+    if flavor:
+        return f"Install it with: {install_command(extra, flavor)}"
+    return (
+        f"Install it with: {install_command(extra, 'pip')} "
+        f"(uv: {install_command(extra, 'uv')}; "
+        f"pipx: {install_command(extra, 'pipx')})"
+    )
+
+
+# State for suppress_stdout. It swaps the process-global sys.stdout, so
+# concurrent users have to be counted rather than each saving and restoring
+# their own idea of "the real stdout" (#431).
+_stdout_lock = threading.Lock()
+_stdout_depth = 0
+_stdout_devnull = None
+_stdout_original = None
+
+
+@contextmanager
+def suppress_stdout():
+    """Context manager to suppress stdout temporarily.
+
+    Reference-counted under a lock. Two MCP tool threads running a semantic
+    search at the same time used to interleave their save/restore of the
+    global ``sys.stdout``: the one that exited last restored a value it had
+    captured while stdout was already redirected, leaving the global pointing
+    at a closed devnull. Every later write to stdout then failed, which on the
+    stdio transport reads as the server dropping the connection (#431). Only
+    the first entrant redirects and only the last one restores; the lock is
+    held for the bookkeeping alone, never for the body.
+    """
+    global _stdout_depth, _stdout_devnull, _stdout_original
+
+    with _stdout_lock:
+        if _stdout_depth == 0:
+            _stdout_original = sys.stdout
+            _stdout_devnull = open(os.devnull, "w")
+            sys.stdout = _stdout_devnull
+        _stdout_depth += 1
+    try:
+        yield
+    finally:
+        with _stdout_lock:
+            _stdout_depth -= 1
+            if _stdout_depth == 0:
+                sys.stdout = _stdout_original
+                devnull, _stdout_devnull = _stdout_devnull, None
+                _stdout_original = None
+                if devnull is not None:
+                    try:
+                        devnull.close()
+                    except Exception:
+                        pass
+
+def format_creators(creators: list[dict[str, str] | str]) -> str:
+    """
+    Format creator names into a string.
+
+    Args:
+        creators: List of creator objects from Zotero.  Each element is
+            typically a dict with firstName/lastName or name keys, but may
+            also be a plain string (e.g. from BetterBibTeX results).
+
+    Returns:
+        Formatted string with creator names.
+    """
+    names = []
+    for creator in creators:
+        if isinstance(creator, str):
+            name = creator
+        else:
+            parts = [creator.get("lastName"), creator.get("firstName")]
+            name = ", ".join(part for part in parts if part) or creator.get("name", "")
+        if name:
+            names.append(name)
+    return "; ".join(names) if names else "No authors listed"
+
+
+def is_local_mode() -> bool:
+    """Return True if running in local mode.
+
+    Local mode is enabled when environment variable `ZOTERO_LOCAL` is set to a
+    truthy value ("true", "yes", or "1", case-insensitive).
+    """
+    value = os.getenv("ZOTERO_LOCAL", "")
+    return value.lower() in {"true", "yes", "1"}
+
+
+# ---------------------------------------------------------------------------
+# Pagination helper
+# ---------------------------------------------------------------------------
+
+def _paginate(zot_method, *args, max_items=None, keep=None, **kwargs):
+    """Fetch all results from a pyzotero method using manual pagination.
+
+    Avoids zot.everything() which can cause RLock pickling in MCP contexts.
+    Accepts the same positional and keyword arguments as the wrapped method,
+    plus an optional max_items to cap the total results, and an optional
+    ``keep`` predicate: only items passing it are returned and counted
+    toward max_items. That is for callers whose own filter would drop a
+    pageful of fetched items (child notes in a titleCreatorYear search,
+    #542) — a full page of filtered-out items is not exhaustion, so paging
+    continues and the cap is not spent on results nobody will see.
+    """
+    items = []
+    start = 0
+    page_size = 100
+    while True:
+        batch = zot_method(*args, start=start, limit=page_size, **kwargs)
+        if not batch:
+            break
+        # Short-page test on the raw count: a full page that keep filters
+        # down to nothing must not read as "the server ran out".
+        fetched = len(batch)
+        if keep is not None:
+            batch = [item for item in batch if keep(item)]
+        items.extend(batch)
+        if fetched < page_size:
+            break
+        start += page_size
+        if max_items and len(items) >= max_items:
+            break
+    # Trimmed on the way out rather than only on the early-exit path. The cap
+    # used to be applied inside the loop, which the last page skips: a run
+    # that ended on a short batch returned everything it had fetched, however
+    # small max_items was. Callers that pass it to bound a *response* — not
+    # just the fetching — then over-reported (#453).
+    if max_items:
+        return items[:max_items]
+    return items
+
+
+def get_search_backend() -> str:
+    """Return the configured read backend: ``"sqlite"`` or ``"api"``.
+
+    ``ZOTERO_BACKEND`` is the setting. ``ZOTERO_SEARCH_BACKEND`` is still
+    honoured as an alias: it selected the SQLite path back when only search
+    used it (#167), and existing deployments set it. Either one naming
+    ``sqlite`` selects SQLite; anything else — including unset — leaves the
+    pyzotero path every deployment already uses.
+
+    Configuration only. The SQLite backend additionally needs local mode and
+    a readable ``zotero.sqlite``, which callers check at the query site and
+    fall back to ``"api"`` when it is missing.
+
+    :func:`zotero_mcp.library.configured_backend` delegates here, so the
+    read port and the older search paths can never disagree about which
+    backend is selected.
+    """
+    chosen = {
+        os.getenv(var, "").strip().lower()
+        for var in ("ZOTERO_BACKEND", "ZOTERO_SEARCH_BACKEND")
+    }
+    if "sqlite" in chosen:
+        return "sqlite"
+    if "api" in chosen:
+        return "api"
+    # Unset: SQLite in local mode, where zotero.sqlite is on this machine and
+    # answers most reads orders of magnitude faster than the API (0.12.1).
+    # Callers still fall back to the API when the file cannot be read.
+    return "sqlite" if is_local_mode() else "api"
+
+
+def item_display_title(data: dict) -> str:
+    """The title to show for an item, whatever field it actually lives in.
+
+    Three item shapes do not keep their title under ``title`` and each used to
+    render as "Untitled" here:
+
+    * Type-specific base fields — a statute's title is ``nameOfAct``, a case's
+      is ``caseName``, an email's is ``subject``. ``schema.resolve_field``
+      maps ``title`` onto whichever key the type uses (#452).
+    * Standalone attachments, which have a ``filename`` and no title.
+    * Notes, whose title is the first line of their body (#447).
+
+    Shared with :func:`zotero_mcp.client.format_item_metadata` so a search
+    result and an item lookup never disagree about what a paper is called.
+    """
+    item_type = data.get("itemType", "")
+
+    if item_type == "note":
+        return note_title(data.get("note", ""))
+
+    if item_type == "annotation":
+        return annotation_title(data)
+
+    resolved_title = ""
+    if item_type:
+        try:
+            from zotero_mcp import schema as _schema
+
+            resolved = _schema.resolve_field(item_type, "title")
+        except Exception:  # schema unavailable — fall back to the plain field
+            resolved = "title"
+        resolved_title = data.get(resolved) or ""
+
+    if item_type == "case":
+        return _case_title(data, resolved_title)
+
+    if resolved_title:
+        return resolved_title
+
+    return data.get("title") or data.get("filename") or "Untitled"
+
+
+#: Zotero's own names for the annotation types (reader.ftl), inconsistent
+#: casing included: matching the client beats tidying it.
+_ANNOTATION_TYPE_NAMES = {
+    "highlight": "Highlight annotation",
+    "underline": "Underline annotation",
+    "note": "Note Annotation",
+    "text": "Text Annotation",
+    "image": "Image Annotation",
+    "ink": "Ink Annotation",
+}
+
+
+def _clip(text: str, limit: int = 50) -> str:
+    """Collapse whitespace and cut to Zotero's 50-character component cap."""
+    text = " ".join(text.split())
+    return text[:limit] + "…" if len(text) > limit else text
+
+
+def annotation_title(data: dict) -> str:
+    """The display title Zotero composes for an annotation, which has no
+    title field (``updateDisplayTitle`` in item.js): quoted text for a
+    highlight or underline, then the comment, else the type's name (#575).
+
+    Both fields are plain text, so no HTML pass: a tag stripper would eat
+    the middle of "p < 0.05 and n > 30".
+    """
+    annotation_type = data.get("annotationType") or ""
+    comment = _clip(data.get("annotationComment") or "")
+
+    title = ""
+    if annotation_type in ("highlight", "underline"):
+        title = "“" + _clip(data.get("annotationText") or "") + "”"
+    if comment:
+        title = f"{title} {comment}" if title else comment
+
+    return title or _ANNOTATION_TYPE_NAMES.get(annotation_type, "") or "Untitled"
+
+
+def _case_title(data: dict, case_name: str) -> str:
+    """A case's name qualified by its reporter, else its court, as Zotero
+    renders it. The SQLite backend hydrates ``caseName`` under the base
+    ``title`` key, hence the fallback."""
+    name = case_name or data.get("title") or ""
+    if not name:
+        return "Untitled"
+    qualifier = data.get("reporter") or data.get("court") or ""
+    return f"{name} ({qualifier})" if qualifier else name
+
+
+def item_display_date(data: dict) -> str:
+    """The date to show for an item, whatever field it actually lives in.
+
+    The mirror of :func:`item_display_title` for the ``date`` base field, and
+    the other half of #452. A case's date is ``dateDecided``, a statute's is
+    ``dateEnacted``, a patent's is ``issueDate``; reading ``data["date"]``
+    directly found nothing and rendered "No date" over a date Zotero holds
+    perfectly well.
+
+    Returns "" when there is genuinely no date, so callers choose their own
+    placeholder.
+    """
+    item_type = data.get("itemType", "")
+    if item_type:
+        try:
+            from zotero_mcp import schema as _schema
+
+            resolved = _schema.resolve_field(item_type, "date")
+        except Exception:  # schema unavailable — fall back to the plain field
+            resolved = "date"
+        if date := data.get(resolved):
+            return str(date)
+
+    return str(data.get("date") or "")
+
+
+def library_label(item: dict) -> str | None:
+    """Human-readable source library for one item, or None if unattributed.
+
+    Reads the top-level ``library`` key that pyzotero items carry and the
+    SQLite backend stamps via ``row_to_api_item``. Renders the personal
+    library as "My Library (personal)" and a group as
+    "<name> (groupID=<id>)", so a global search's results say where each hit
+    lives (#163).
+    """
+    library = item.get("library")
+    if not isinstance(library, dict):
+        return None
+    name = str(library.get("name") or "").strip()
+    library_id = library.get("id")
+    if library.get("type") in ("user", "users"):
+        return f"{name or 'My Library'} (personal)"
+    if library_id is None:
+        return name or None
+    return f"{name or 'Group'} (groupID={library_id})"
+
+
+def format_item_result(
+    item: dict,
+    index: int | None = None,
+    abstract_len: int | None = 200,
+    include_tags: bool = True,
+    extra_fields: dict[str, str] | None = None,
+    show_library: bool = False,
+) -> list[str]:
+    """Format a single Zotero item as markdown lines.
+
+    Args:
+        item: Zotero item dict (with ``data`` and ``key`` keys).
+        index: 1-based position for numbered headings; omit for unnumbered.
+        abstract_len: Max characters for abstract (``None`` = full text,
+            ``0`` = omit entirely).
+        include_tags: Whether to append tags.
+        extra_fields: Additional ``**Label:** value`` pairs inserted after
+            authors (e.g. ``{"Similarity Score": "0.912"}``).
+        show_library: Add a ``**Library:**`` line naming the item's source
+            library. Off by default so single-library output is unchanged;
+            global searches turn it on, where the label is the whole point.
+
+    Returns:
+        List of markdown lines (caller joins with ``"\\n"``).
+    """
+    data = item.get("data", {})
+    title = item_display_title(data)
+    heading = f"## {index}. {title}" if index is not None else f"## {title}"
+    lines: list[str] = [
+        heading,
+        f"**Type:** {data.get('itemType', 'unknown')}",
+        f"**Item Key:** {item.get('key', '')}",
+        f"**Date:** {item_display_date(data) or 'No date'}",
+        f"**Authors:** {format_creators(data.get('creators', []))}",
+    ]
+
+    if show_library and (label := library_label(item)):
+        lines.insert(3, f"**Library:** {label}")
+
+    # Trash status. pyzotero's default list endpoints filter trashed items
+    # out, but not every call site does (e.g. includeTrashed=1, direct
+    # item() lookups routed through this formatter). Defense in depth —
+    # surface the flag whenever data.deleted is set so agents never silently
+    # reason about a trashed paper as if it were live.
+    if data.get("deleted"):
+        lines.append("**Status:** 🗑️ In Trash")
+
+    if extra_fields:
+        for label, value in extra_fields.items():
+            lines.append(f"**{label}:** {value}")
+
+    if abstract_len != 0:
+        abstract = data.get("abstractNote", "")
+        if abstract:
+            if abstract_len and len(abstract) > abstract_len:
+                abstract = abstract[:abstract_len] + "..."
+            lines.append(f"**Abstract:** {abstract}")
+
+    if include_tags:
+        if tags := data.get("tags"):
+            tag_list = [f"`{t['tag']}`" for t in tags]
+            if tag_list:
+                lines.append(f"**Tags:** {' '.join(tag_list)}")
+
+    lines.append("")  # blank separator
+    return lines
+
+
+def clean_html(raw_html: str, collapse_whitespace: bool = False) -> str:
+    """Remove HTML/XML tags from a string.
+
+    Args:
+        raw_html: String containing HTML content.
+        collapse_whitespace: If True, collapse runs of whitespace into a
+            single space and strip leading/trailing whitespace. Useful for
+            cleaning JATS XML from CrossRef abstracts.
+    Returns:
+        Cleaned string without HTML tags.
+    """
+    if not raw_html:
+        return ""
+    clean_text = re.sub(html_re, "", raw_html)
+    if collapse_whitespace:
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    return clean_text
+
+
+#: Inline markup a Zotero field renders rather than shows literally. Anything
+#: outside this set is dropped, tags only — the text between them is kept.
+#: Mirrors the ``supportedMarkup`` list in Zotero's own "Crossref REST"
+#: translator, so a record mapped here looks like one saved from the browser.
+_SUPPORTED_MARKUP = frozenset({"i", "b", "sub", "sup", "span", "sc"})
+
+#: ``<scp>`` means small caps, which Zotero expresses as a styled span.
+_SMALL_CAPS_OPEN = '<span style="font-variant:small-caps;">'
+
+# ``\w`` is ASCII here, as it is in the JavaScript this ports: a tag name
+# is ASCII, and Python's Unicode ``\w`` would swallow "<bİa>" as one name
+# and drop a "<b>" the original keeps. This cannot reuse ``html_re``
+# above -- that pattern is non-greedy and matches across "<", so it cannot
+# express the original's "[^<>]*" semantics.
+_MARKUP_TAG_RE = re.compile(r"<(/?)(\w+)[^<>]*>", re.ASCII)
+_CDATA_RE = re.compile(r"<!\[CDATA\[([\s\S]*?)\]\]>")
+
+
+def strip_unsupported_markup(text: str) -> str:
+    """Drop markup Zotero would not render, keeping the inline subset.
+
+    CrossRef serves titles containing JATS and MathML — ``<mml:math>``,
+    ``<alt-title>``, CDATA sections — alongside the ordinary ``<i>`` and
+    ``<sub>`` that carry real meaning in a species name or a formula.
+    Stripping everything (``clean_html``) loses the meaning; keeping
+    everything puts raw MathML in the title bar.
+
+    This is a port of ``removeUnsupportedMarkup`` from Zotero's "Crossref
+    REST" translator, so a DOI added here reads like the same DOI saved
+    from the browser connector.
+    """
+    if not text:
+        return ""
+    text = _CDATA_RE.sub(r"\1", text)
+
+    def _replace(match):
+        closing, name = match.group(1), match.group(2).lower()
+        if name in _SUPPORTED_MARKUP:
+            return f"</{name}>" if closing else f"<{name}>"
+        if name == "scp":
+            return "</span>" if closing else _SMALL_CAPS_OPEN
+        return ""
+
+    return _MARKUP_TAG_RE.sub(_replace, text)
+
+
+#: Closing tags of line-level blocks. Dropped rather than turned into a
+#: newline: the *opening* tag of the next item already supplies one, and
+#: emitting both would put a blank line between every pair of list items.
+_LINE_BREAK_CLOSE_RE = re.compile(r"</(?:li|tr|dt|dd)\s*>", re.IGNORECASE)
+
+#: Tags that end a line but not a paragraph — a list item, a table row, an
+#: explicit break. These get a single newline.
+_LINE_BREAK_RE = re.compile(r"<(?:br|li|tr|dt|dd)\b[^>]*>", re.IGNORECASE)
+
+#: Tags that end a paragraph-level block. These get a blank line, so prose
+#: stays readable as markdown rather than becoming one wall of text.
+_PARA_BREAK_RE = re.compile(
+    r"</?(?:p|div|ul|ol|table|h[1-6]|blockquote|pre|section|article)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+#: The four XML predefined entities CrossRef escapes in deposited strings.
+_XML_ENTITIES = {"&amp;": "&", "&quot;": '"', "&lt;": "<", "&gt;": ">"}
+_XML_ENTITY_RE = re.compile("|".join(_XML_ENTITIES))
+
+#: C0/C1 control characters. Their presence in a CrossRef string is the
+#: signature of UTF-8 bytes decoded as Latin-1 and re-served as UTF-8 --
+#: an en dash arriving as "a<80><93>".
+_CONTROL_CHARS_RE = re.compile(r"[\u007F-\u009F]")
+_STRIP_CONTROLS_RE = re.compile(r"[\u0000-\u001F\u007F-\u009F]")
+
+
+def repair_crossref_string(text: str) -> str:
+    """Undo the two ways CrossRef mangles a deposited string.
+
+    A port of the per-field loop at the end of ``doSearch`` in Zotero's
+    "Crossref REST" translator: repair mojibake, then decode the XML
+    entities and drop the newlines the registry stores literally.
+
+    Both are ordinary rather than exotic. In a 1200-record sample, 1.25%
+    of titles carried an XML entity and 1.4% carried a newline -- a raw
+    newline in a title also breaks this package's own markdown headings.
+    """
+    if not isinstance(text, str):
+        return text
+    if _CONTROL_CHARS_RE.search(text):
+        try:
+            text = text.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            text = _STRIP_CONTROLS_RE.sub("", text)
+    return _XML_ENTITY_RE.sub(lambda m: _XML_ENTITIES[m.group(0)],
+                              text.replace("\n", ""))
+
+
+def html_to_text(raw_html: str) -> str:
+    """Strip HTML to plain text, preserving block structure as line breaks.
+
+    :func:`clean_html` removes tags without putting anything in their place,
+    which is right for an inline fragment and wrong for a document. Zotero
+    stores notes as HTML with no newlines between blocks, so
+    ``<p>Title</p><p>Body</p>`` came back as ``TitleBody`` — which, among
+    other things, made the note's "first line" the whole note (#447).
+    """
+    if not raw_html:
+        return ""
+    text = _PARA_BREAK_RE.sub("\n\n", raw_html)
+    text = _LINE_BREAK_CLOSE_RE.sub("", text)
+    text = _LINE_BREAK_RE.sub("\n", text)
+    text = clean_html(text)
+    # Substitution leaves runs of blank lines behind (a `</p><p>` pair emits
+    # four newlines). Normalise to at most one blank line, and drop the
+    # trailing spaces each line may have picked up.
+    lines = [line.strip() for line in text.splitlines()]
+    out: list[str] = []
+    for line in lines:
+        if not line and (not out or not out[-1]):
+            continue  # leading, or a second consecutive blank
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def note_title(note_html: str, max_chars: int = 80) -> str:
+    """Derive a display title for a note from its content.
+
+    Notes are the one item type with no `title` field: Zotero's own client
+    shows the note's first line instead, and the API has nothing to offer in
+    its place. Formatting a note through the generic item path therefore
+    rendered every one of them as "Untitled" (#447).
+    """
+    text = html_to_text(note_html or "")
+    if not text:
+        return "Untitled Note"
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if not first_line:
+        return "Untitled Note"
+    if len(first_line) > max_chars:
+        return first_line[:max_chars].rstrip() + "…"
+    return first_line
+
+
+# ---------------------------------------------------------------------------
+# Search normalization utilities
+# ---------------------------------------------------------------------------
+
+# German umlaut expansions (common in academic literature)
+_UMLAUT_MAP = {
+    'ü': 'ue', 'ö': 'oe', 'ä': 'ae', 'ß': 'ss',
+    'Ü': 'Ue', 'Ö': 'Oe', 'Ä': 'Ae',
+}
+
+MAX_SEARCH_VARIANTS = 15
+
+
+def _normalize_for_search(text: str) -> str:
+    """Normalize text for fuzzy matching: transliterate to ASCII.
+
+    ``unidecode`` handles CJK, Greek, Cyrillic and diacritics, and already
+    maps Unicode dashes to ASCII hyphens. A separate dash regex used to run
+    after it; it matched only non-ASCII characters in pure-ASCII output, so it
+    never changed anything, and it made this (called once per stored row by
+    ``zsearch_norm``) about seven times slower.
+    """
+    if not text:
+        return text
+    return unidecode(text)
+
+
+def _generate_search_variants(query: str) -> list[str]:
+    """Generate variant forms of a search query for fuzzy matching.
+
+    Returns a deduplicated list of query variants, capped at
+    ``MAX_SEARCH_VARIANTS``.  Typically produces 2-5 variants for real
+    author names.
+    """
+    if not query or not query.strip():
+        return [query] if query else []
+
+    variants: set[str] = {query}
+
+    # ASCII transliteration (Müller → Muller, 王 → Wang)
+    ascii_form = _normalize_for_search(query)
+    if ascii_form != query:
+        variants.add(ascii_form)
+
+    # Dashes to spaces (Cladder-Micus → Cladder Micus)
+    dash_to_space = query.replace('-', ' ')
+    if dash_to_space != query:
+        variants.add(dash_to_space)
+    dash_to_space_norm = ascii_form.replace('-', ' ')
+    if dash_to_space_norm not in variants:
+        variants.add(dash_to_space_norm)
+
+    # German umlaut expansions (Müller → Mueller)
+    umlaut_expanded = query
+    for char, expansion in _UMLAUT_MAP.items():
+        umlaut_expanded = umlaut_expanded.replace(char, expansion)
+    if umlaut_expanded != query:
+        variants.add(umlaut_expanded)
+
+    # Spaces to dashes (Cladder Micus → Cladder-Micus)
+    if ' ' in query and '-' not in query:
+        space_to_dash = query.replace(' ', '-')
+        variants.add(space_to_dash)
+
+    # Cap variants
+    result = list(variants)
+    if len(result) > MAX_SEARCH_VARIANTS:
+        result = result[:MAX_SEARCH_VARIANTS]
+
+    return result
+
+
+def capitalize_name(name):
+    """Title-case a name that a registry stored in capitals.
+
+    CrossRef records — especially those migrated from older publisher
+    systems — carry creator names as ``R SOLE`` or ``O'NEAL``. Zotero's
+    "Crossref REST" translator repairs these on the way in; without the
+    same repair a library ends up shouting.
+
+    Only wholly-uppercase or wholly-lowercase words are touched, which is
+    what protects names that are already correctly mixed:
+
+        >>> capitalize_name("R SOLE")
+        'R Sole'
+        >>> capitalize_name("O'NEAL")
+        "O'Neal"
+        >>> capitalize_name("John MacGregor O'NEILL")
+        "John MacGregor O'Neill"
+        >>> capitalize_name("O'neal")
+        "O'neal"
+
+    A port of ``Zotero.Utilities.capitalizeName``, including that last
+    case: ``O'neal`` is mixed-case, so it is left as the source had it
+    rather than being second-guessed.
+
+    Takes and returns whatever it is given: the original guards against an
+    absent given name, and mirroring that keeps a missing field missing
+    rather than turning it into ``"None"``.
+
+    One deliberate divergence. The original upper-cases the character
+    *before* the letter as well, so it maps symbols that happen to carry
+    case -- "x(circled a)y" becomes "X(circled A)Y" there and keeps the
+    symbol here. No author name is affected; do not "fix" it back.
+    """
+    if not isinstance(name, str):
+        return name
+    return " ".join(_capitalize_word(word) for word in name.split(" "))
+
+
+def _capitalize_word(word: str) -> str:
+    """Title-case one whitespace-free word, leaving mixed case alone."""
+    if word.upper() != word and word.lower() != word:
+        return word
+    out = []
+    prev_was_letter = False
+    for char in word.lower():
+        out.append(char.upper() if char.isalpha() and not prev_was_letter else char)
+        prev_was_letter = char.isalpha()
+    return "".join(out)
